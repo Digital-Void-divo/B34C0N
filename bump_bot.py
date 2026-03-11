@@ -13,14 +13,14 @@ SETUP:
 3. Push all files to GitHub, Railway will auto-deploy
 
 COMMANDS:
-  /leaderboard    — View the bump leaderboard
+  /bumpboard      — View the bump leaderboard
   /bumpstats      — View stats for yourself or another member
   /beaconscrape   — (Admin only) Scan full channel history and calculate all bumps + steals
 
 FUTURE EXPANSION POINTS (marked with # TODO: ACHIEVEMENTS):
   - add_achievement() helper is ready to uncomment and call from anywhere
   - Hook points already placed after every bump and steal
-  - Placeholder spots in /leaderboard and /bumpstats for generated badge images
+  - Placeholder spots in /bumpboard and /bumpstats for generated badge images
 """
 
 import discord
@@ -57,7 +57,7 @@ def github_api_url() -> str:
 _file_sha: str | None = None
 
 def load_data() -> dict:
-    """Read bump_data.json from GitHub."""
+    """Read bump_data.json from GitHub. Returns empty state if file doesn't exist yet."""
     global _file_sha
     try:
         response = requests.get(github_api_url(), headers=github_headers(), timeout=10)
@@ -65,6 +65,10 @@ def load_data() -> dict:
             payload = response.json()
             _file_sha = payload["sha"]
             return json.loads(base64.b64decode(payload["content"]).decode("utf-8"))
+        elif response.status_code == 404:
+            # File doesn't exist yet — will be created on first save
+            _file_sha = None
+            print("[B34C0N] bump_data.json not found on GitHub — will create on first save.")
         else:
             print(f"⚠️  GitHub load failed: {response.status_code}")
     except Exception as e:
@@ -72,19 +76,21 @@ def load_data() -> dict:
     return {"bumps": {}, "steals": {}, "last_bump_time": None}
 
 def save_data(data: dict):
-    """Write bump_data.json back to GitHub as a commit."""
+    """Write bump_data.json to GitHub. Creates the file if it doesn't exist yet."""
     global _file_sha
     content = base64.b64encode(json.dumps(data, indent=2).encode("utf-8")).decode("utf-8")
     payload = {
         "message": "chore: update bump data",
         "content": content,
     }
+    # Only include SHA if we have one (updating). Omit for first-time creation.
     if _file_sha:
         payload["sha"] = _file_sha
     try:
         response = requests.put(github_api_url(), headers=github_headers(), json=payload, timeout=10)
         if response.status_code in (200, 201):
             _file_sha = response.json()["content"]["sha"]
+            print(f"[B34C0N] bump_data.json saved to GitHub (SHA: {_file_sha[:7]})")
         else:
             print(f"⚠️  GitHub save failed: {response.status_code} {response.text}")
     except Exception as e:
@@ -98,9 +104,24 @@ def get_user_record(data: dict, user_id: str) -> dict:
         # "achievements": data.get("achievements", {}).get(user_id, []),
     }
 
+def is_steal(current_ts: datetime, previous_ts: datetime) -> bool:
+    """
+    Returns True if current_ts falls within STEAL_WINDOW_SECONDS after
+    the BUMP_COOLDOWN_HOURS window from previous_ts.
+    Both timestamps must be timezone-aware (UTC).
+    """
+    # Ensure both are UTC-aware
+    if current_ts.tzinfo is None:
+        current_ts = current_ts.replace(tzinfo=timezone.utc)
+    if previous_ts.tzinfo is None:
+        previous_ts = previous_ts.replace(tzinfo=timezone.utc)
+
+    cooldown_reset   = previous_ts + timedelta(hours=BUMP_COOLDOWN_HOURS)
+    steal_window_end = cooldown_reset + timedelta(seconds=STEAL_WINDOW_SECONDS)
+    return cooldown_reset <= current_ts <= steal_window_end
+
 # TODO: ACHIEVEMENTS
 # def add_achievement(data: dict, user_id: str, achievement_id: str, achievement_name: str):
-#     """Award an achievement to a user. Safe to call multiple times — won't duplicate."""
 #     data.setdefault("achievements", {}).setdefault(user_id, [])
 #     existing_ids = [a["id"] for a in data["achievements"][user_id]]
 #     if achievement_id not in existing_ids:
@@ -121,6 +142,29 @@ intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 pending_bumps: dict[int, tuple[int, datetime]] = {}
 
+# ─── HELPERS ──────────────────────────────────────────────────────────────────
+
+def get_interaction_user_id(message: discord.Message) -> int | None:
+    """
+    Safely get the user ID from a slash command message.
+    Uses interaction_metadata (new) with fallback to interaction (deprecated).
+    """
+    # New API (discord.py 2.4+)
+    if hasattr(message, "interaction_metadata") and message.interaction_metadata is not None:
+        return message.interaction_metadata.user.id
+    # Fallback for older discord.py
+    if message.interaction is not None:
+        return message.interaction.user.id
+    return None
+
+def get_interaction_name(message: discord.Message) -> str | None:
+    """Safely get the slash command name from a message."""
+    if hasattr(message, "interaction_metadata") and message.interaction_metadata is not None:
+        return message.interaction_metadata.name
+    if message.interaction is not None:
+        return message.interaction.name
+    return None
+
 # ─── EVENTS ───────────────────────────────────────────────────────────────────
 
 @bot.event
@@ -135,10 +179,11 @@ async def on_message(message: discord.Message):
     # Track who triggered /bump before DISBOARD responds
     if (
         message.type == discord.MessageType.chat_input_command
-        and message.interaction is not None
-        and message.interaction.name == "bump"
+        and get_interaction_name(message) == "bump"
     ):
-        pending_bumps[message.channel.id] = (message.interaction.user.id, datetime.now(timezone.utc))
+        user_id = get_interaction_user_id(message)
+        if user_id:
+            pending_bumps[message.channel.id] = (user_id, datetime.now(timezone.utc))
 
     # Detect DISBOARD's success embed
     if message.author.id == DISBOARD_BOT_ID and message.embeds:
@@ -159,11 +204,12 @@ async def handle_successful_bump(disboard_message: discord.Message):
         async for msg in disboard_message.channel.history(limit=10, before=disboard_message):
             if (
                 msg.type == discord.MessageType.chat_input_command
-                and msg.interaction is not None
-                and msg.interaction.name == "bump"
+                and get_interaction_name(msg) == "bump"
             ):
-                bump_entry = (msg.interaction.user.id, msg.created_at)
-                break
+                user_id = get_interaction_user_id(msg)
+                if user_id:
+                    bump_entry = (user_id, msg.created_at)
+                    break
 
     if bump_entry is None:
         print(f"⚠️  Could not attribute bump in #{disboard_message.channel.name}")
@@ -178,19 +224,17 @@ async def handle_successful_bump(disboard_message: discord.Message):
     data["bumps"][user_id_str] = data["bumps"].get(user_id_str, 0) + 1
 
     # Check for steal
-    is_steal = False
+    bump_is_steal = False
     if last_bump_iso:
-        last_bump_time = datetime.fromisoformat(last_bump_iso)
-        cooldown_reset = last_bump_time + timedelta(hours=BUMP_COOLDOWN_HOURS)
-        steal_window_end = cooldown_reset + timedelta(seconds=STEAL_WINDOW_SECONDS)
-        if cooldown_reset <= now <= steal_window_end:
-            is_steal = True
+        last_ts = datetime.fromisoformat(last_bump_iso)
+        if is_steal(now, last_ts):
+            bump_is_steal = True
             data["steals"][user_id_str] = data["steals"].get(user_id_str, 0) + 1
 
-    # TODO: ACHIEVEMENTS — example hooks
+    # TODO: ACHIEVEMENTS
     # if data["bumps"][user_id_str] == 10:
     #     add_achievement(data, user_id_str, "bump_10", "Grid Traveler")
-    # if is_steal:
+    # if bump_is_steal:
     #     add_achievement(data, user_id_str, "first_steal", "Signal Thief")
 
     data["last_bump_time"] = now.isoformat()
@@ -204,15 +248,15 @@ async def handle_successful_bump(disboard_message: discord.Message):
         display_name = f"<@{user_id}>"
 
     record = get_user_record(data, user_id_str)
-    color = discord.Color.gold() if is_steal else discord.Color.teal()
-    title = "⚡ STEAL — SIGNAL INTERCEPTED" if is_steal else "✅ B34C0N CONFIRMED"
+    color = discord.Color.gold() if bump_is_steal else discord.Color.teal()
+    title = "⚡ STEAL — SIGNAL INTERCEPTED" if bump_is_steal else "✅ B34C0N CONFIRMED"
     lines = [
         f"**{display_name}** transmitted the server beacon.",
         f"🔼 Total bumps: **{record['bumps']}**",
     ]
     if record["steals"]:
         lines.append(f"⚡ Steals: **{record['steals']}**")
-    if is_steal:
+    if bump_is_steal:
         lines.append(f"\n*Signal intercepted within {STEAL_WINDOW_SECONDS}s of cooldown reset.*")
 
     embed = discord.Embed(title=title, description="\n".join(lines), color=color, timestamp=now)
@@ -220,8 +264,8 @@ async def handle_successful_bump(disboard_message: discord.Message):
 
 # ─── SLASH COMMANDS ───────────────────────────────────────────────────────────
 
-@bot.tree.command(name="leaderboard", description="View the bump leaderboard for The Digital Wasteland")
-async def leaderboard(interaction: discord.Interaction):
+@bot.tree.command(name="bumpboard", description="View the bump leaderboard for The Digital Wasteland")
+async def bumpboard(interaction: discord.Interaction):
     data = load_data()
 
     if not data["bumps"]:
@@ -243,6 +287,8 @@ async def leaderboard(interaction: discord.Interaction):
     last_bump = data.get("last_bump_time")
     if last_bump:
         last_dt = datetime.fromisoformat(last_bump)
+        if last_dt.tzinfo is None:
+            last_dt = last_dt.replace(tzinfo=timezone.utc)
         next_bump = last_dt + timedelta(hours=BUMP_COOLDOWN_HOURS)
         now = datetime.now(timezone.utc)
         if now < next_bump:
@@ -298,12 +344,6 @@ async def bumpstats(interaction: discord.Interaction, member: discord.Member = N
 @bot.tree.command(name="beaconscrape", description="[Admin] Scan full channel history to calculate all bumps and steals")
 @app_commands.checks.has_permissions(administrator=True)
 async def beaconscrape(interaction: discord.Interaction):
-    """
-    Scrapes the entire channel history for DISBOARD bump confirmations.
-    For each bump it looks at the message immediately before to attribute it to a user.
-    Then calculates steals based on exact millisecond timestamps.
-    Overwrites bump_data.json with the full historical results.
-    """
     await interaction.response.defer(ephemeral=True)
     await interaction.followup.send(
         "🔍 Scanning channel history... this may take a moment for large channels.",
@@ -311,15 +351,11 @@ async def beaconscrape(interaction: discord.Interaction):
     )
 
     channel = interaction.channel
-
-    # Collect all DISBOARD bump confirmations with their timestamps
-    # Each entry: {"timestamp": datetime, "user_id": int | None}
     bump_events = []
 
     print(f"[beaconscrape] Starting scan of #{channel.name}...")
 
     async for message in channel.history(limit=None, oldest_first=True):
-        # Check if this is a DISBOARD bump confirmation
         if message.author.id != DISBOARD_BOT_ID:
             continue
         if not message.embeds:
@@ -330,27 +366,26 @@ async def beaconscrape(interaction: discord.Interaction):
         if "Bump done" not in description and not (embed.title and "Bump done" in embed.title):
             continue
 
-        # Try to find who bumped by looking at the message just before this one
+        # Attribute bump — look at messages immediately before this one
         user_id = None
         async for prev in channel.history(limit=5, before=message, oldest_first=False):
-            # Look for a slash command interaction
-            if (
-                prev.type == discord.MessageType.chat_input_command
-                and prev.interaction is not None
-                and prev.interaction.name == "bump"
-            ):
-                user_id = prev.interaction.user.id
-                break
-            # Also accept regular messages from non-bots as a fallback
-            # (older bumps may not have interaction metadata)
-            if not prev.author.bot and prev.author.id != DISBOARD_BOT_ID:
+            # Prefer slash command interaction (most accurate)
+            if prev.type == discord.MessageType.chat_input_command:
+                cmd_name = get_interaction_name(prev)
+                if cmd_name == "bump":
+                    user_id = get_interaction_user_id(prev)
+                    break
+            # Fallback: any non-bot message just before the confirmation
+            if not prev.author.bot:
                 user_id = prev.author.id
                 break
 
-        bump_events.append({
-            "timestamp": message.created_at,
-            "user_id": user_id,
-        })
+        # Ensure timestamp is UTC-aware
+        ts = message.created_at
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+
+        bump_events.append({"timestamp": ts, "user_id": user_id})
 
     if not bump_events:
         await interaction.followup.send("❌ No DISBOARD bump confirmations found in this channel.", ephemeral=True)
@@ -358,12 +393,7 @@ async def beaconscrape(interaction: discord.Interaction):
 
     print(f"[beaconscrape] Found {len(bump_events)} bump events. Calculating steals...")
 
-    # Calculate bumps and steals from the sorted event list
-    new_data = {
-        "bumps": {},
-        "steals": {},
-        "last_bump_time": None,
-    }
+    new_data = {"bumps": {}, "steals": {}, "last_bump_time": None}
 
     for i, event in enumerate(bump_events):
         uid = str(event["user_id"]) if event["user_id"] else "unknown"
@@ -372,18 +402,17 @@ async def beaconscrape(interaction: discord.Interaction):
         # Award bump
         new_data["bumps"][uid] = new_data["bumps"].get(uid, 0) + 1
 
-        # Check for steal — compare to previous bump's cooldown reset
+        # Check for steal against previous bump's timestamp
         if i > 0:
             prev_ts = bump_events[i - 1]["timestamp"]
-            cooldown_reset  = prev_ts + timedelta(hours=BUMP_COOLDOWN_HOURS)
-            steal_window_end = cooldown_reset + timedelta(seconds=STEAL_WINDOW_SECONDS)
-            if cooldown_reset <= ts <= steal_window_end:
+            if is_steal(ts, prev_ts):
                 new_data["steals"][uid] = new_data["steals"].get(uid, 0) + 1
+                print(f"[beaconscrape] Steal detected: user {uid} at {ts} (prev bump: {prev_ts})")
 
-    # Record the last bump time so live tracking continues correctly
+    # Record last bump time for live tracking to continue correctly
     new_data["last_bump_time"] = bump_events[-1]["timestamp"].isoformat()
 
-    # Remove "unknown" entries if any — unattributed bumps
+    # Separate out unattributed bumps
     unattributed = new_data["bumps"].pop("unknown", 0)
     new_data["steals"].pop("unknown", None)
 
@@ -413,7 +442,7 @@ async def beaconscrape(interaction: discord.Interaction):
     )
     embed.add_field(name="Total Bumps", value=str(total_bumps), inline=True)
     embed.add_field(name="Total Steals", value=str(total_steals), inline=True)
-    embed.add_field(name="Scanned Messages", value=str(len(bump_events)), inline=True)
+    embed.add_field(name="Scanned Events", value=str(len(bump_events)), inline=True)
     embed.set_footer(text="bump_data.json has been updated on GitHub.")
 
     print(f"[beaconscrape] Done. {total_bumps} bumps, {total_steals} steals, {unattributed} unattributed.")
