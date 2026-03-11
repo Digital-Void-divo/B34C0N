@@ -1,7 +1,7 @@
 """
-UPLINK — Bump Tracker for The Digital Wasteland
+B34C0N — Bump Tracker for The Digital Wasteland
 ================================================
-Tracks DISBOARD bumps and steals with /leaderboard and /bumpstats slash commands.
+Tracks DISBOARD bumps and steals with slash commands.
 bump_data.json lives in your GitHub repo and is read/written via the GitHub API
 on every successful bump. Railway only needs BOT_TOKEN and GITHUB_TOKEN set.
 
@@ -11,6 +11,11 @@ SETUP:
    - GITHUB_TOKEN   → GitHub Personal Access Token (repo scope)
 2. Update GITHUB_REPO below to match your repo (e.g. "yourname/digital-wasteland-bot")
 3. Push all files to GitHub, Railway will auto-deploy
+
+COMMANDS:
+  /leaderboard    — View the bump leaderboard
+  /bumpstats      — View stats for yourself or another member
+  /beaconscrape   — (Admin only) Scan full channel history and calculate all bumps + steals
 
 FUTURE EXPANSION POINTS (marked with # TODO: ACHIEVEMENTS):
   - add_achievement() helper is ready to uncomment and call from anywhere
@@ -49,7 +54,7 @@ def github_headers() -> dict:
 def github_api_url() -> str:
     return f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE}"
 
-_file_sha: str | None = None  # GitHub requires the current SHA to update a file
+_file_sha: str | None = None
 
 def load_data() -> dict:
     """Read bump_data.json from GitHub."""
@@ -75,7 +80,7 @@ def save_data(data: dict):
         "content": content,
     }
     if _file_sha:
-        payload["sha"] = _file_sha  # required for updates, not needed for first commit
+        payload["sha"] = _file_sha
     try:
         response = requests.put(github_api_url(), headers=github_headers(), json=payload, timeout=10)
         if response.status_code in (200, 201):
@@ -104,8 +109,8 @@ def get_user_record(data: dict, user_id: str) -> dict:
 #             "name": achievement_name,
 #             "awarded_at": datetime.now(timezone.utc).isoformat(),
 #         })
-#         return True  # newly awarded
-#     return False  # already had it
+#         return True
+#     return False
 
 # ─── BOT SETUP ────────────────────────────────────────────────────────────────
 
@@ -121,7 +126,7 @@ pending_bumps: dict[int, tuple[int, datetime]] = {}
 @bot.event
 async def on_ready():
     await bot.tree.sync()
-    print(f"✅ UPLINK online as {bot.user} (ID: {bot.user.id})")
+    print(f"✅ B34C0N online as {bot.user} (ID: {bot.user.id})")
     print(f"   Steal window: {STEAL_WINDOW_SECONDS}s | Slash commands synced")
     print(f"   Persisting data to: github.com/{GITHUB_REPO}/{GITHUB_FILE}")
 
@@ -200,7 +205,7 @@ async def handle_successful_bump(disboard_message: discord.Message):
 
     record = get_user_record(data, user_id_str)
     color = discord.Color.gold() if is_steal else discord.Color.teal()
-    title = "⚡ STEAL — SIGNAL INTERCEPTED" if is_steal else "✅ UPLINK CONFIRMED"
+    title = "⚡ STEAL — SIGNAL INTERCEPTED" if is_steal else "✅ B34C0N CONFIRMED"
     lines = [
         f"**{display_name}** transmitted the server beacon.",
         f"🔼 Total bumps: **{record['bumps']}**",
@@ -235,7 +240,6 @@ async def leaderboard(interaction: discord.Interaction):
         steal_str = f"  ⚡ {steals} steals" if steals else ""
         lines.append(f"{medal} **{name}** — {count} bumps{steal_str}")
 
-    # Next bump timer
     last_bump = data.get("last_bump_time")
     if last_bump:
         last_dt = datetime.fromisoformat(last_bump)
@@ -251,7 +255,7 @@ async def leaderboard(interaction: discord.Interaction):
         footer = "No transmissions recorded yet"
 
     embed = discord.Embed(
-        title="📡 THE DIGITAL WASTELAND — UPLINK LEADERBOARD",
+        title="📡 THE DIGITAL WASTELAND — B34C0N LEADERBOARD",
         description="\n".join(lines),
         color=discord.Color.teal(),
         timestamp=datetime.now(timezone.utc),
@@ -259,6 +263,7 @@ async def leaderboard(interaction: discord.Interaction):
     embed.set_footer(text=f"{footer}  •  ⚡ = steals")
     # TODO: ACHIEVEMENTS — add a generated banner image here
     await interaction.response.send_message(embed=embed)
+
 
 @bot.tree.command(name="bumpstats", description="View bump stats for yourself or another member")
 @app_commands.describe(member="The member to look up (defaults to you)")
@@ -277,7 +282,7 @@ async def bumpstats(interaction: discord.Interaction, member: discord.Member = N
                 break
 
     embed = discord.Embed(
-        title=f"📊 UPLINK STATS — {target.display_name}",
+        title=f"📊 B34C0N STATS — {target.display_name}",
         color=discord.Color.teal(),
     )
     embed.set_thumbnail(url=target.display_avatar.url)
@@ -288,6 +293,137 @@ async def bumpstats(interaction: discord.Interaction, member: discord.Member = N
     # TODO: ACHIEVEMENTS — add achievement badges with generated images here
 
     await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="beaconscrape", description="[Admin] Scan full channel history to calculate all bumps and steals")
+@app_commands.checks.has_permissions(administrator=True)
+async def beaconscrape(interaction: discord.Interaction):
+    """
+    Scrapes the entire channel history for DISBOARD bump confirmations.
+    For each bump it looks at the message immediately before to attribute it to a user.
+    Then calculates steals based on exact millisecond timestamps.
+    Overwrites bump_data.json with the full historical results.
+    """
+    await interaction.response.defer(ephemeral=True)
+    await interaction.followup.send(
+        "🔍 Scanning channel history... this may take a moment for large channels.",
+        ephemeral=True
+    )
+
+    channel = interaction.channel
+
+    # Collect all DISBOARD bump confirmations with their timestamps
+    # Each entry: {"timestamp": datetime, "user_id": int | None}
+    bump_events = []
+
+    print(f"[beaconscrape] Starting scan of #{channel.name}...")
+
+    async for message in channel.history(limit=None, oldest_first=True):
+        # Check if this is a DISBOARD bump confirmation
+        if message.author.id != DISBOARD_BOT_ID:
+            continue
+        if not message.embeds:
+            continue
+
+        embed = message.embeds[0]
+        description = embed.description or ""
+        if "Bump done" not in description and not (embed.title and "Bump done" in embed.title):
+            continue
+
+        # Try to find who bumped by looking at the message just before this one
+        user_id = None
+        async for prev in channel.history(limit=5, before=message, oldest_first=False):
+            # Look for a slash command interaction
+            if (
+                prev.type == discord.MessageType.chat_input_command
+                and prev.interaction is not None
+                and prev.interaction.name == "bump"
+            ):
+                user_id = prev.interaction.user.id
+                break
+            # Also accept regular messages from non-bots as a fallback
+            # (older bumps may not have interaction metadata)
+            if not prev.author.bot and prev.author.id != DISBOARD_BOT_ID:
+                user_id = prev.author.id
+                break
+
+        bump_events.append({
+            "timestamp": message.created_at,
+            "user_id": user_id,
+        })
+
+    if not bump_events:
+        await interaction.followup.send("❌ No DISBOARD bump confirmations found in this channel.", ephemeral=True)
+        return
+
+    print(f"[beaconscrape] Found {len(bump_events)} bump events. Calculating steals...")
+
+    # Calculate bumps and steals from the sorted event list
+    new_data = {
+        "bumps": {},
+        "steals": {},
+        "last_bump_time": None,
+    }
+
+    for i, event in enumerate(bump_events):
+        uid = str(event["user_id"]) if event["user_id"] else "unknown"
+        ts  = event["timestamp"]
+
+        # Award bump
+        new_data["bumps"][uid] = new_data["bumps"].get(uid, 0) + 1
+
+        # Check for steal — compare to previous bump's cooldown reset
+        if i > 0:
+            prev_ts = bump_events[i - 1]["timestamp"]
+            cooldown_reset  = prev_ts + timedelta(hours=BUMP_COOLDOWN_HOURS)
+            steal_window_end = cooldown_reset + timedelta(seconds=STEAL_WINDOW_SECONDS)
+            if cooldown_reset <= ts <= steal_window_end:
+                new_data["steals"][uid] = new_data["steals"].get(uid, 0) + 1
+
+    # Record the last bump time so live tracking continues correctly
+    new_data["last_bump_time"] = bump_events[-1]["timestamp"].isoformat()
+
+    # Remove "unknown" entries if any — unattributed bumps
+    unattributed = new_data["bumps"].pop("unknown", 0)
+    new_data["steals"].pop("unknown", None)
+
+    save_data(new_data)
+
+    # Build result summary
+    total_bumps  = sum(new_data["bumps"].values())
+    total_steals = sum(new_data["steals"].values())
+    sorted_bumpers = sorted(new_data["bumps"].items(), key=lambda x: x[1], reverse=True)
+
+    lines = []
+    for uid, count in sorted_bumpers[:10]:
+        member = interaction.guild.get_member(int(uid))
+        name = member.display_name if member else f"Unknown ({uid})"
+        steals = new_data["steals"].get(uid, 0)
+        steal_str = f"  ⚡ {steals} steals" if steals else ""
+        lines.append(f"**{name}** — {count} bumps{steal_str}")
+
+    if unattributed:
+        lines.append(f"\n⚠️ {unattributed} bump(s) could not be attributed to a user.")
+
+    embed = discord.Embed(
+        title="📡 B34C0N SCRAPE COMPLETE",
+        description="\n".join(lines) if lines else "No attributable bumps found.",
+        color=discord.Color.teal(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="Total Bumps", value=str(total_bumps), inline=True)
+    embed.add_field(name="Total Steals", value=str(total_steals), inline=True)
+    embed.add_field(name="Scanned Messages", value=str(len(bump_events)), inline=True)
+    embed.set_footer(text="bump_data.json has been updated on GitHub.")
+
+    print(f"[beaconscrape] Done. {total_bumps} bumps, {total_steals} steals, {unattributed} unattributed.")
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@beaconscrape.error
+async def beaconscrape_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("❌ You need Administrator permissions to run this command.", ephemeral=True)
 
 # ─── RUN ──────────────────────────────────────────────────────────────────────
 
