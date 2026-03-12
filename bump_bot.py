@@ -474,15 +474,18 @@ async def beaconscrape(interaction: discord.Interaction):
     sorted_bumpers = sorted(new_data["bumps"].items(), key=lambda x: x[1], reverse=True)
 
     lines = []
+    display_bumps = 0
+    display_steals = 0
     for uid, count in sorted_bumpers[:10]:
         member = interaction.guild.get_member(int(uid))
-        name = member.display_name if member else new_data.get("names", {}).get(uid, f"Unknown ({uid})")
+        name = member.display_name if member else new_data.get("names", {}).get(uid)
+        if not name:
+            continue  # skip users who left and have no cached name
         steals = new_data["steals"].get(uid, 0)
         steal_str = f"  ⚡ {steals} steals" if steals else ""
         lines.append(f"**{name}** — {count} bumps{steal_str}")
-
-    if unattributed:
-        lines.append(f"\n⚠️ {unattributed} bump(s) could not be attributed to a user.")
+        display_bumps += count
+        display_steals += steals
 
     embed = discord.Embed(
         title="📡 B34C0N SCRAPE COMPLETE",
@@ -490,10 +493,9 @@ async def beaconscrape(interaction: discord.Interaction):
         color=discord.Color.teal(),
         timestamp=datetime.now(timezone.utc),
     )
-    embed.add_field(name="Total Bumps", value=str(total_bumps), inline=True)
-    embed.add_field(name="Total Steals", value=str(total_steals), inline=True)
+    embed.add_field(name="Total Bumps", value=str(display_bumps), inline=True)
+    embed.add_field(name="Total Steals", value=str(display_steals), inline=True)
     embed.add_field(name="Scanned Events", value=str(len(bump_events)), inline=True)
-    embed.set_footer(text="bump_data.json has been updated on GitHub.")
 
     print(f"[beaconscrape] Done. {total_bumps} bumps, {total_steals} steals, {unattributed} unattributed.")
     await interaction.followup.send(embed=embed, ephemeral=True)
