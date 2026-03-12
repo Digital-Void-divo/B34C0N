@@ -82,12 +82,19 @@ def load_data() -> dict:
 def save_data(data: dict):
     """Write bump_data.json to GitHub. Creates the file if it doesn't exist yet."""
     global _file_sha
-    content = base64.b64encode(json.dumps(data, indent=2).encode("utf-8")).decode("utf-8")
+    # If we have no SHA cached, fetch it — the file may already exist on GitHub
+    if not _file_sha:
+        try:
+            r = requests.get(github_api_url(), headers=github_headers(), timeout=10)
+            if r.status_code == 200:
+                _file_sha = r.json().get("sha")
+        except Exception as e:
+            print(f"⚠️  GitHub SHA prefetch error: {e}")
+    encoded = base64.b64encode(json.dumps(data, indent=2).encode("utf-8")).decode("utf-8")
     payload = {
         "message": "chore: update bump data",
-        "content": content,
+        "content": encoded,
     }
-    # Only include SHA if we have one (updating). Omit for first-time creation.
     if _file_sha:
         payload["sha"] = _file_sha
     try:
@@ -176,45 +183,22 @@ intents.message_content = True
 intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
-pending_bumps: dict[int, tuple[int, datetime]] = {}
 
 # ─── HELPERS ──────────────────────────────────────────────────────────────────
 
 def get_interaction_user_id(message: discord.Message) -> int | None:
-    """
-    Safely get the user ID from a slash command message.
-    Uses interaction_metadata (new) with fallback to interaction (deprecated).
-    """
+    """Get the user ID of whoever triggered the slash command that produced this message."""
     if hasattr(message, "interaction_metadata") and message.interaction_metadata is not None:
         try:
             return message.interaction_metadata.user.id
         except AttributeError:
             pass
-    # Fallback — suppress the deprecation warning since we're using it intentionally
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", DeprecationWarning)
-        if message.interaction is not None:
-            return message.interaction.user.id
     return None
 
 def get_interaction_name(message: discord.Message) -> str | None:
-    """
-    Safely get the slash command name from a message.
-    Tries interaction_metadata (current API) first, falls back to the
-    deprecated interaction attribute only if needed.
-    """
+    """Get the slash command name that produced this message."""
     if hasattr(message, "interaction_metadata") and message.interaction_metadata is not None:
-        name = getattr(message.interaction_metadata, "name", None)
-        if name:
-            return name
-    # Fallback for older discord.py — suppress the deprecation warning
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", DeprecationWarning)
-        try:
-            if message.interaction is not None:
-                return message.interaction.name
-        except Exception:
-            pass
+        return getattr(message.interaction_metadata, "name", None)
     return None
 
 # ─── EVENTS ───────────────────────────────────────────────────────────────────
@@ -228,15 +212,6 @@ async def on_ready():
 
 @bot.event
 async def on_message(message: discord.Message):
-    # Track who triggered /bump before DISBOARD responds
-    if (
-        message.type == discord.MessageType.chat_input_command
-        and get_interaction_name(message) == "bump"
-    ):
-        user_id = get_interaction_user_id(message)
-        if user_id:
-            pending_bumps[message.channel.id] = (user_id, datetime.now(timezone.utc))
-
     # Detect DISBOARD's success embed
     if message.author.id == DISBOARD_BOT_ID and message.embeds:
         embed = message.embeds[0]
@@ -247,27 +222,13 @@ async def on_message(message: discord.Message):
     await bot.process_commands(message)
 
 async def handle_successful_bump(disboard_message: discord.Message):
-    channel_id = disboard_message.channel.id
     now = datetime.now(timezone.utc)
 
-    # Attribute the bump to a user
-    bump_entry = pending_bumps.pop(channel_id, None)
-    if bump_entry is None:
-        async for msg in disboard_message.channel.history(limit=10, before=disboard_message):
-            if (
-                msg.type == discord.MessageType.chat_input_command
-                and get_interaction_name(msg) == "bump"
-            ):
-                user_id = get_interaction_user_id(msg)
-                if user_id:
-                    bump_entry = (user_id, msg.created_at)
-                    break
-
-    if bump_entry is None:
+    # DISBOARD's confirmation message carries interaction_metadata identifying the bumper
+    user_id = get_interaction_user_id(disboard_message)
+    if user_id is None:
         print(f"⚠️  Could not attribute bump in #{disboard_message.channel.name}")
         return
-
-    user_id, _ = bump_entry
     user_id_str = str(user_id)
     data = load_data()
     last_bump_iso = data.get("last_bump_time")
@@ -375,8 +336,9 @@ async def bumpstats(interaction: discord.Interaction, member: discord.Member = N
                 rank = i + 1
                 break
 
+    title_name = target.mention if (target != interaction.user) else target.display_name
     embed = discord.Embed(
-        title=f"📊 B34C0N STATS — {target.display_name}",
+        title=f"📊 B34C0N STATS — {title_name}",
         color=discord.Color.teal(),
     )
     embed.set_thumbnail(url=target.display_avatar.url)
@@ -447,20 +409,11 @@ async def beaconscrape(interaction: discord.Interaction):
         if "Bump done" not in description and not (embed.title and "Bump done" in embed.title):
             continue
 
-        # Attribute bump by scanning backwards through already-fetched messages
-        user_id = None
+        # DISBOARD's confirmation carries interaction_metadata — that's the bumper
+        user_id = get_interaction_user_id(message)
         display_name = None
-        for prev in reversed(all_messages[:idx]):
-            if prev.type == discord.MessageType.chat_input_command:
-                cmd_name = get_interaction_name(prev)
-                if cmd_name == "bump":
-                    user_id = get_interaction_user_id(prev)
-                    display_name = prev.author.display_name
-                    break
-            if not prev.author.bot:
-                user_id = prev.author.id
-                display_name = prev.author.display_name
-                break
+        if user_id == DISBOARD_BOT_ID:
+            user_id = None  # sanity: never credit DISBOARD itself
 
         # Ensure timestamp is UTC-aware
         ts = message.created_at
