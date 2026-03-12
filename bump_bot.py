@@ -336,9 +336,8 @@ async def bumpstats(interaction: discord.Interaction, member: discord.Member = N
                 rank = i + 1
                 break
 
-    title_name = target.mention if (target != interaction.user) else target.display_name
     embed = discord.Embed(
-        title=f"📊 B34C0N STATS — {title_name}",
+        title=f"📊 B34C0N STATS — {target.display_name}",
         color=discord.Color.teal(),
     )
     embed.set_thumbnail(url=target.display_avatar.url)
@@ -348,7 +347,8 @@ async def bumpstats(interaction: discord.Interaction, member: discord.Member = N
         embed.add_field(name="🏆 Rank", value=f"#{rank} of {len(data['bumps'])}", inline=True)
     # TODO: ACHIEVEMENTS — add achievement badges with generated images here
 
-    await interaction.response.send_message(embed=embed)
+    content = target.mention if target != interaction.user else None
+    await interaction.response.send_message(content=content, embed=embed)
 
 
 @bot.tree.command(name="beaconscrape", description="[Admin] Scan full channel history to calculate all bumps and steals")
