@@ -40,12 +40,12 @@ import requests
 
 BOT_TOKEN    = os.environ.get("BOT_TOKEN", "")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
-GITHUB_REPO  = "yourname/digital-wasteland-bot"  # ← Update this before pushing
+GITHUB_REPO  = "Digital-Void-divo/BEACON"
 GITHUB_FILE  = "bump_data.json"
 
 DISBOARD_BOT_ID      = 302050872383242240
 BUMP_COOLDOWN_HOURS  = 2
-STEAL_WINDOW_SECONDS = 10
+STEAL_WINDOW_SECONDS = 30
 
 # ─── GITHUB DATA HELPERS ──────────────────────────────────────────────────────
 
