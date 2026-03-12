@@ -131,6 +131,8 @@ async def resolve_display_name(guild: discord.Guild, user_id: int, data: dict) -
     if cached:
         return f"{cached} (left)"
     return f"Unknown ({uid_str})"
+
+def is_steal(current_ts: datetime, previous_ts: datetime) -> bool:
     """
     Returns True if current_ts falls within STEAL_WINDOW_SECONDS after
     the BUMP_COOLDOWN_HOURS window from previous_ts.
@@ -314,6 +316,7 @@ async def bumpboard(interaction: discord.Interaction):
         steal_str = f"  ⚡ {steals} steals" if steals else ""
         lines.append(f"{medal} **{name}** — {count} bumps{steal_str}")
 
+    last_bump = data.get("last_bump_time")
     if last_bump:
         last_dt = datetime.fromisoformat(last_bump)
         if last_dt.tzinfo is None:
@@ -387,11 +390,12 @@ async def beaconscrape(interaction: discord.Interaction):
     # Fetch ALL messages in a single pass into memory — no nested API calls
     all_messages = []
     last_update = datetime.now(timezone.utc)
+    bumps_found = 0
 
     async for message in channel.history(limit=None, oldest_first=True):
         all_messages.append(message)
 
-        # Count bump confirmations seen so far for progress reporting
+        # Count bump confirmations cheaply as we go
         if (
             message.author.id == DISBOARD_BOT_ID
             and message.embeds
@@ -399,24 +403,11 @@ async def beaconscrape(interaction: discord.Interaction):
             embed = message.embeds[0]
             desc = embed.description or ""
             if "Bump done" in desc or (embed.title and "Bump done" in embed.title):
-                bump_events_so_far = sum(
-                    1 for m in all_messages
-                    if m.author.id == DISBOARD_BOT_ID
-                    and m.embeds
-                    and ("Bump done" in (m.embeds[0].description or "") or
-                         (m.embeds[0].title and "Bump done" in m.embeds[0].title))
-                )
+                bumps_found += 1
 
         # Send a progress update every 15 seconds
         now = datetime.now(timezone.utc)
         if (now - last_update).total_seconds() >= 15:
-            bumps_found = sum(
-                1 for m in all_messages
-                if m.author.id == DISBOARD_BOT_ID
-                and m.embeds
-                and ("Bump done" in (m.embeds[0].description or "") or
-                     (m.embeds[0].title and "Bump done" in m.embeds[0].title))
-            )
             await interaction.edit_original_response(
                 content=f"🔍 Still scanning... **{len(all_messages):,}** messages read, **{bumps_found}** bumps found so far."
             )
