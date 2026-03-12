@@ -39,12 +39,12 @@ import requests
 
 BOT_TOKEN    = os.environ.get("BOT_TOKEN", "")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
-GITHUB_REPO  = "Digital-Void-divo/BEACON"
+GITHUB_REPO  = "Digital-Void-divo/BEACON"  # ← Update this before pushing
 GITHUB_FILE  = "bump_data.json"
 
 DISBOARD_BOT_ID      = 302050872383242240
 BUMP_COOLDOWN_HOURS  = 2
-STEAL_WINDOW_SECONDS = 20
+STEAL_WINDOW_SECONDS = 30
 
 # ─── GITHUB DATA HELPERS ──────────────────────────────────────────────────────
 
@@ -81,10 +81,19 @@ def load_data() -> dict:
 def save_data(data: dict):
     """Write bump_data.json to GitHub. Creates the file if it doesn't exist yet."""
     global _file_sha
-    content = base64.b64encode(json.dumps(data, indent=2).encode("utf-8")).decode("utf-8")
+    # If we have no SHA cached, fetch it now — the file may already exist
+    # (e.g. beaconscrape builds new_data without calling load_data first)
+    if not _file_sha:
+        try:
+            r = requests.get(github_api_url(), headers=github_headers(), timeout=10)
+            if r.status_code == 200:
+                _file_sha = r.json().get("sha")
+        except Exception as e:
+            print(f"⚠️  GitHub SHA prefetch error: {e}")
+    encoded = base64.b64encode(json.dumps(data, indent=2).encode("utf-8")).decode("utf-8")
     payload = {
         "message": "chore: update bump data",
-        "content": content,
+        "content": encoded,
     }
     # Only include SHA if we have one (updating). Omit for first-time creation.
     if _file_sha:
